@@ -15,12 +15,24 @@ import pandas as pd
 import time
 import matplotlib
 
+import os, shutil, subprocess
 import matplotlib.pyplot as plt
+from scipy.ndimage import binary_erosion, distance_transform_edt
+from tqdm.auto import tqdm
 
 from dataset import get_dataloaders
 from modules import get_model
 
 PROSTATE_LABEL = 5  # Same label as train.py; also stored in the checkpoint
+NUM_CLASSES = 6
+LABEL_NAMES = {
+    0: "Outside body",
+    1: "Remaining tissue",
+    2: "Bone",
+    3: "Bladder",
+    4: "Rectum",
+    5: "Prostate",
+}
 
 matplotlib.use("Agg")
 
@@ -166,7 +178,6 @@ def synchronise(device):
 
 def select_preview_slices(dataset, patient_id=None, week=None, count=5):
     """Pick `count` evenly spaced slices containing prostate from one patient's scan."""
-    prefix = f"case_{patient_id}_week_{week}_slice_"
     slice_number = lambda i: int(re.search(r"_slice_(\d+)", dataset.pairs[i][0].name).group(1))
 
     scans = sorted({
@@ -224,8 +235,6 @@ def save_preview(model, dataset, indices, output_dir, model_name, device, title)
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
-
-import os, shutil, subprocess
 
 def open_file(path):
     """Open a file with the system's default application, if one is available."""
@@ -295,6 +304,87 @@ def predict(model, test_loader, output_dir, device, checkpoint):
     profile = pd.Series(results, name="Resource profile").to_frame()
     print(profile)
 
+
+def calculate_hd95(predicted, reference):
+    """Symmetric 95th percentile Hausdorff distance between two binary masks, in pixels."""
+    if not predicted.any() and not reference.any():
+        return np.nan  # No structure present: boundary distance is undefined.
+
+    if not predicted.any() or not reference.any():
+        return np.inf  # A structure was completely missed or falsely predicted.
+
+    predicted_boundary = predicted & ~binary_erosion(predicted, border_value=0)
+    reference_boundary = reference & ~binary_erosion(reference, border_value=0)
+
+    # Distance from every pixel to the closest boundary pixel.
+    distance_to_reference = distance_transform_edt(~reference_boundary)
+    distance_to_prediction = distance_transform_edt(~predicted_boundary)
+
+    distances = np.concatenate([
+        distance_to_reference[predicted_boundary],
+        distance_to_prediction[reference_boundary],
+    ])
+    return float(np.percentile(distances, 95))
+
+
+def evaluate_test_set(model, test_loader, device):
+    """Return per-class Dice, IoU and HD95 over the whole test set, as in train_isensse."""
+    # Accumulate overlap counts across all test slices.
+    intersections = np.zeros(NUM_CLASSES, dtype=np.int64)
+    predicted_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+    reference_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+    boundary_distances = [[] for _ in range(NUM_CLASSES)]
+
+    with torch.inference_mode():
+        for images, masks in tqdm(test_loader, desc="Test metrics", leave=False, mininterval=5):
+            predictions = model(images.to(device)).argmax(dim=1).cpu().numpy()
+            masks = masks.numpy()
+
+            for prediction, reference in zip(predictions, masks):
+                # Remove padding before extracting boundaries.
+                valid = reference != -100
+                rows, columns = np.where(valid)
+                region = (
+                    slice(rows.min(), rows.max() + 1),
+                    slice(columns.min(), columns.max() + 1),
+                )
+                prediction = prediction[region]
+                reference = reference[region]
+                valid = valid[region]
+
+                for label in range(NUM_CLASSES):
+                    predicted = (prediction == label) & valid
+                    actual = (reference == label) & valid
+
+                    intersections[label] += (predicted & actual).sum()
+                    predicted_counts[label] += predicted.sum()
+                    reference_counts[label] += actual.sum()
+                    boundary_distances[label].append(calculate_hd95(predicted, actual))
+
+    results = []
+    for label in range(NUM_CLASSES):
+        intersection = intersections[label]
+        denominator = predicted_counts[label] + reference_counts[label]
+        union = denominator - intersection
+
+        distances = np.asarray(boundary_distances[label])
+        finite_distances = distances[np.isfinite(distances)]
+
+        results.append({
+            "Label": label,
+            "Structure": LABEL_NAMES[label],
+            "Dice": 2 * intersection / denominator if denominator else np.nan,
+            "IoU": intersection / union if union else np.nan,
+            "Mean HD95, finite slices (pixels)": (
+                finite_distances.mean() if finite_distances.size else np.nan
+            ),
+            "Finite HD95 slices": int(np.isfinite(distances).sum()),
+            "One mask empty (HD95 infinite)": int(np.isinf(distances).sum()),
+            "Both masks empty (HD95 undefined)": int(np.isnan(distances).sum()),
+        })
+
+    return pd.DataFrame(results).set_index("Label")
+
 def main():
     args = parse_args()
 
@@ -313,6 +403,16 @@ def main():
     )
 
     predict(model, test_loader, args.output_dir, device, checkpoint)
+
+    metrics = evaluate_test_set(model, test_loader, device)
+    print("\nTest metrics")
+    print(metrics.round(4).to_string())
+    print("\nProstate:")
+    print(metrics.loc[[PROSTATE_LABEL]].round(4).to_string())
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = args.output_dir / f"{args.model_name}_test_metrics.csv"
+    metrics.to_csv(metrics_path)
+    print("Saved test metrics to", metrics_path)
 
     indices, patient_id, week = select_preview_slices(
         test_loader.dataset, args.patient, args.week, args.num_slices
