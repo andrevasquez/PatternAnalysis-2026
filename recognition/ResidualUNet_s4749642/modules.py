@@ -169,9 +169,86 @@ class ResidualUNet(UNet):
 
         # Inherit the baseline's forward method and unchanged decoder.
 
+class ResidualContextBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, dropout=0.0):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.InstanceNorm2d(in_channels, affine=True),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(in_channels, out_channels, 3, padding=1),
+            nn.Dropout2d(dropout) if dropout else nn.Identity(),
+            nn.InstanceNorm2d(out_channels, affine=True),
+            nn.LeakyReLU(negative_slope=0.01),
+            nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        )
+        self.shortcut = (nn.Identity() if in_channels == out_channels
+                         else nn.Conv2d(in_channels, out_channels, 1))
+
+    def forward(self, x):
+        return self.layers(x) + self.shortcut(x)
+
+
+def decoder_block(in_channels, out_channels):
+    return nn.Sequential(
+        nn.Conv2d(in_channels, out_channels, 3, padding=1), nn.ReLU(),
+        nn.Conv2d(out_channels, out_channels, 3, padding=1), nn.ReLU(),
+    )
+
 class IsenseeUNet(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, base=BASE):
         super().__init__()
+        # Prepare for the successive layers with increasing / doubling of image
+        # resolution
+        widths = [base * 2**i for i in range(5)]
+        # Prepare the encoder layer list
+        self.encoders = nn.ModuleList()
+        in_channels = 1
+        # Add the successive ResidualContextBlock with increasing image resolution to the encoder
+        # layers
+        for i, width in enumerate(widths):
+            self.encoders.append(ResidualContextBlock(
+                in_channels, width, dropout=0.3 if i >= 3 else 0))
+            in_channels = width
+        self.pool = nn.MaxPool2d(2)
+        self.upsamples = nn.ModuleList()
+        # Prepare the decoder layer list
+        self.decoders = nn.ModuleList()
+        # Add the successive ResidualContextBlock with increasing image resolution to the encoder
+        # layers
+        for i in range(4, 0, -1):
+            self.upsamples.append(nn.ConvTranspose2d(
+                widths[i], widths[i-1], 3, stride=2, padding=1, output_padding=1))
+            self.decoders.append(decoder_block(2 * widths[i-1], widths[i-1]))
+        self.output = nn.Conv2d(base, num_classes, 1)
+        # Initialise encoder convolutions for leaky ReLU and decoder ones for ReLU.
+        for block in self.encoders:
+            for layer in block.modules():
+                # fills an input tensor with values sampled from normal distribution
+                # using the Kaiming (He) initialization method. This technique is 
+                # specifically optimized to preserve variance across deep networks using 
+                # rectifying activation functions like ReLU or Leaky ReLU.
+                # Also, initialise the bias to zero
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(layer.weight, a=0.01, nonlinearity="leaky_relu")
+                    nn.init.zeros_(layer.bias)
+        for block in self.decoders:
+            for layer in block.modules():
+                if isinstance(layer, nn.Conv2d):
+                    nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                    nn.init.zeros_(layer.bias)
+
+    def forward(self, x):
+        if x.shape[-2] % 16 or x.shape[-1] % 16:
+            raise ValueError("Input height and width must be divisible by 16")
+        skips = []
+        for encoder in self.encoders[:-1]:
+            x = encoder(x)
+            skips.append(x)
+            x = self.pool(x)
+        x = self.encoders[-1](x)
+        for upsample, decoder, skip in zip(self.upsamples, self.decoders, reversed(skips)):
+            x = decoder(torch.cat([upsample(x), skip], dim=1))
+        return self.output(x)  # Raw class scores; do not apply softmax before CE.
 
 def get_model(model_name):
     if model_name == "baseline":
