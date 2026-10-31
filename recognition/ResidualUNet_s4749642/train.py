@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from dataset import get_dataloaders
+
 # Setup constants
 NUM_CLASSES = 6
 PROSTATE_LABEL = 5  # Other labels can be found in dataset notebook
@@ -136,8 +138,7 @@ def set_seed(seed):
 
 def build_loaders(data_dir, batch_size, device):
     """Return train, validation and test DataLoaders."""
-    # TODO: build HipMRIDataset splits from data_dir (see dataset.ipynb)
-    raise NotImplementedError
+    return get_dataloaders(data_dir, batch_size, device)
 
 
 def build_model(model_type, device):
