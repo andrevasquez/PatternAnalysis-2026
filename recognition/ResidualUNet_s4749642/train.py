@@ -5,7 +5,9 @@ Example:
 """
 
 import argparse
+import csv
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -59,9 +61,10 @@ def parse_args():
         type=str,
         required=True,
         help=(
-            "Name for the saved model file, without extension.\n"
-            "e.g. 'residual_unet' saves to <checkpoint-dir>/residual_unet.pt.\n"
-            "An existing file with the same name is overwritten."
+            "Name for the saved model and output files, without extension.\n"
+            "e.g. 'residual_unet' saves to <checkpoint-dir>/residual_unet.pt\n"
+            "and <output-dir>/residual_unet_training_profile.csv.\n"
+            "Existing files with the same name are overwritten."
         ),
     )
 
@@ -83,6 +86,17 @@ def parse_args():
         default=Path("./checkpoints"),
         help=(
             "Directory where the trained model is saved.\n"
+            "Created if it does not exist.\n"
+            "(default: %(default)s)"
+        ),
+    )
+    paths.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs"),
+        help=(
+            "Directory for run outputs such as the training profile,\n"
+            "saved as <output-dir>/<model-name>_training_profile.csv.\n"
             "Created if it does not exist.\n"
             "(default: %(default)s)"
         ),
@@ -190,6 +204,42 @@ def evaluate(model, loader, criterion, device):
     return train_one_epoch(model, loader, None, criterion, device, training=False)
 
 
+def training_profile(device, epoch_seconds, training_start):
+    """Return training time and peak GPU memory, as in the training notebooks."""
+    profile = {
+        "Device": str(device),
+        "Completed epochs": len(epoch_seconds),
+        "Recorded epoch time (min)": sum(epoch_seconds) / 60,
+        "Wall time (min)": (time.perf_counter() - training_start) / 60,
+    }
+    if device.type == "cuda":
+        profile.update({
+            "GPU": torch.cuda.get_device_name(device),
+            "Peak allocated VRAM (GiB)": torch.cuda.max_memory_allocated(device) / 1024**3,
+            "Peak reserved VRAM (GiB)": torch.cuda.max_memory_reserved(device) / 1024**3,
+        })
+    return profile
+
+
+def print_profile(profile):
+    print("Training profile")
+    width = max(len(name) for name in profile)
+    for name, value in profile.items():
+        # Round floats for display only; the CSV keeps full precision.
+        shown = f"{value:.3f}" if isinstance(value, float) else value
+        print(f"  {name:<{width}}  {shown}")
+
+
+def save_profile(profile, output_dir, model_name):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{model_name}_training_profile.csv"
+    with open(path, "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["metric", "value"])
+        writer.writerows(profile.items())
+    return path
+
+
 def save_model(model, checkpoint_dir, model_name):
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"{model_name}.pt"
@@ -212,15 +262,31 @@ def main():
     # Ignore artificial padding added by the dataset loader.
     criterion = torch.nn.CrossEntropyLoss(ignore_index=-100)
 
+    # Start timing and track peak PyTorch GPU memory during training and validation.
+    training_start = time.perf_counter()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
+
     # Training and validation
+    epoch_seconds = []
     for epoch in range(1, args.epochs + 1):
+        epoch_start = time.perf_counter()
         train_loss, train_dice = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_dice = evaluate(model, val_loader, criterion, device)
+        epoch_seconds.append(time.perf_counter() - epoch_start)
+        elapsed = time.perf_counter() - training_start
         print(
             f"Epoch {epoch}/{args.epochs} | "
             f"train loss {train_loss:.4f} dice {train_dice:.4f} | "
-            f"val loss {val_loss:.4f} dice {val_dice:.4f}"
+            f"val loss {val_loss:.4f} dice {val_dice:.4f} | "
+            f"{epoch_seconds[-1]:.1f}s | elapsed {elapsed / 60:.1f} min",
+            flush=True,
         )
+
+    profile = training_profile(device, epoch_seconds, training_start)
+    print_profile(profile)
+    print("Saved training profile to", save_profile(profile, args.output_dir, args.model_name))
 
     # Testing
     test_loss, test_dice = evaluate(model, test_loader, criterion, device)
