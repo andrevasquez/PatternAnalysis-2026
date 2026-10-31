@@ -118,9 +118,56 @@ class UNet(nn.Module):
         # Returns raw scores (logits)
         return self.output(x)
 
-class ResidualUNet(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES, base=BASE):
+class ResidualBlock(nn.Module):
+    """Baseline convolution block with an added residual shortcut."""
+    # Quick residual test, AI generated.
+
+    def __init__(self, in_channels, out_channels, dropout=0):
         super().__init__()
+
+        # Keep the baseline's convolution and dropout arrangement.
+        self.layers = conv_block(in_channels, out_channels, dropout)
+
+        # Match channel counts before adding the two paths.
+        self.shortcut = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        )
+
+        # Initialise the new shortcut consistently with the feature layers.
+        if isinstance(self.shortcut, nn.Conv2d):
+            nn.init.kaiming_normal_(
+                self.shortcut.weight, nonlinearity="relu"
+            )
+            nn.init.zeros_(self.shortcut.bias)
+
+    def forward(self, x):
+        return self.layers(x) + self.shortcut(x)
+
+
+class ResidualUNet(UNet):
+    def __init__(self, num_classes=NUM_CLASSES, base=BASE):
+        super().__init__(num_classes=num_classes, base=base)
+
+        widths = [base * 2**i for i in range(5)]
+        residual_encoders = nn.ModuleList()
+
+        # Wrap the existing encoder blocks, preserving their initial weights.
+        for i, width in enumerate(widths):
+            in_channels = 1 if i == 0 else widths[i - 1]
+
+            block = ResidualBlock(
+                in_channels,
+                width,
+                dropout=0.3 if i >= 3 else 0,
+            )
+            block.layers = self.encoders[i]
+            residual_encoders.append(block)
+
+        self.encoders = residual_encoders
+
+        # Inherit the baseline's forward method and unchanged decoder.
 
 class IsenseeUNet(nn.Module):
     def __init__(self, num_classes=NUM_CLASSES, base=BASE):
