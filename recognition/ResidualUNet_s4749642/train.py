@@ -16,7 +16,7 @@ import torch
 from tqdm.auto import tqdm
 
 from dataset import get_dataloaders
-from modules import get_model
+from modules import BASE, get_model
 
 # Setup constants
 NUM_CLASSES = 6
@@ -63,7 +63,7 @@ def parse_args():
         help=(
             "Name for the saved model and output files, without extension.\n"
             "e.g. 'residual_unet' saves to <checkpoint-dir>/residual_unet.pt\n"
-            "and <output-dir>/residual_unet_training_profile.csv.\n"
+            "and <output-dir>/residual_unet_summary.csv.\n"
             "Existing files with the same name are overwritten."
         ),
     )
@@ -95,8 +95,9 @@ def parse_args():
         type=Path,
         default=Path("outputs"),
         help=(
-            "Directory for run outputs such as the training profile,\n"
-            "saved as <output-dir>/<model-name>_training_profile.csv.\n"
+            "Directory for run outputs: <model-name>_summary.csv\n"
+            "(settings, training profile and test results) and\n"
+            "<model-name>_history.csv (per-epoch loss and Dice).\n"
             "Created if it does not exist.\n"
             "(default: %(default)s)"
         ),
@@ -204,12 +205,27 @@ def evaluate(model, loader, criterion, device):
     return train_one_epoch(model, loader, None, criterion, device, training=False)
 
 
-def training_profile(device, epoch_seconds, training_start):
+def run_settings(args, model):
+    """Return the settings needed to reproduce this run."""
+    return {
+        "Model type": args.model_type,
+        "Model name": args.model_name,
+        "Parameters": sum(p.numel() for p in model.parameters()),
+        "Epochs": args.epochs,
+        "Batch size": args.batch_size,
+        "Optimizer": "Adam",
+        "Learning rate": args.lr,
+        "Seed": args.seed,
+        "Data directory": str(args.data_dir),
+    }
+
+
+def training_profile(device, history, training_start):
     """Return training time and peak GPU memory, as in the training notebooks."""
     profile = {
         "Device": str(device),
-        "Completed epochs": len(epoch_seconds),
-        "Recorded epoch time (min)": sum(epoch_seconds) / 60,
+        "Completed epochs": len(history),
+        "Recorded epoch time (min)": sum(row["seconds"] for row in history) / 60,
         "Wall time (min)": (time.perf_counter() - training_start) / 60,
     }
     if device.type == "cuda":
@@ -221,8 +237,8 @@ def training_profile(device, epoch_seconds, training_start):
     return profile
 
 
-def print_profile(profile):
-    print("Training profile")
+def print_profile(title, profile):
+    print(title)
     width = max(len(name) for name in profile)
     for name, value in profile.items():
         # Round floats for display only; the CSV keeps full precision.
@@ -232,7 +248,7 @@ def print_profile(profile):
 
 def save_profile(profile, output_dir, model_name):
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"{model_name}_training_profile.csv"
+    path = output_dir / f"{model_name}_summary.csv"
     with open(path, "w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["metric", "value"])
@@ -240,10 +256,36 @@ def save_profile(profile, output_dir, model_name):
     return path
 
 
-def save_model(model, checkpoint_dir, model_name):
+def save_history(history, output_dir, model_name):
+    """Save per-epoch loss, Dice and time, one row per epoch."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{model_name}_history.csv"
+    with open(path, "w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(history[0]))
+        writer.writeheader()
+        writer.writerows(history)
+    return path
+
+
+def save_model(model, checkpoint_dir, args, history, target_size):
+    """Save the weights with the settings needed to rebuild the model, as in the notebooks."""
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    path = checkpoint_dir / f"{model_name}.pt"
-    torch.save(model.state_dict(), path)
+    path = checkpoint_dir / f"{args.model_name}.pt"
+    payload = dict(
+        model_state_dict=model.state_dict(),
+        model_type=args.model_type,
+        num_classes=NUM_CLASSES,
+        base=BASE,
+        prostate_label=PROSTATE_LABEL,
+        target_size=target_size,
+        epoch=len(history),
+        val_prostate_dice=history[-1]["val_prostate_dice"],
+        history=history,
+        learning_rate=args.lr,
+        batch_size=args.batch_size,
+        seed=args.seed,
+    )
+    torch.save(payload, path)
     return path
 
 
@@ -269,31 +311,46 @@ def main():
         torch.cuda.reset_peak_memory_stats(device)
 
     # Training and validation
-    epoch_seconds = []
+    history = []
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_loss, train_dice = train_one_epoch(model, train_loader, optimizer, criterion, device)
         val_loss, val_dice = evaluate(model, val_loader, criterion, device)
-        epoch_seconds.append(time.perf_counter() - epoch_start)
+        seconds = time.perf_counter() - epoch_start
+        history.append(dict(
+            epoch=epoch,
+            train_loss=train_loss, train_prostate_dice=train_dice,
+            val_loss=val_loss, val_prostate_dice=val_dice,
+            seconds=seconds,
+        ))
         elapsed = time.perf_counter() - training_start
         print(
             f"Epoch {epoch}/{args.epochs} | "
             f"train loss {train_loss:.4f} dice {train_dice:.4f} | "
             f"val loss {val_loss:.4f} dice {val_dice:.4f} | "
-            f"{epoch_seconds[-1]:.1f}s | elapsed {elapsed / 60:.1f} min",
+            f"{seconds:.1f}s | elapsed {elapsed / 60:.1f} min",
             flush=True,
         )
 
-    profile = training_profile(device, epoch_seconds, training_start)
-    print_profile(profile)
-    print("Saved training profile to", save_profile(profile, args.output_dir, args.model_name))
+    # Measure the profile before testing so it covers training and validation only.
+    profile = training_profile(device, history, training_start)
+    print_profile("Training profile", profile)
+    print("Saved history to", save_history(history, args.output_dir, args.model_name))
 
     # Testing
     test_loss, test_dice = evaluate(model, test_loader, criterion, device)
     print(f"Test loss {test_loss:.4f} dice {test_dice:.4f}")
 
+    settings = run_settings(args, model)
+    print_profile("Run settings", settings)
+    results = {"Test loss": test_loss, "Test prostate Dice": test_dice}
+    path = save_profile({**settings, **profile, **results}, args.output_dir, args.model_name)
+    print("Saved summary to", path)
+
     # Saving
-    path = save_model(model, args.checkpoint_dir, args.model_name)
+    path = save_model(
+        model, args.checkpoint_dir, args, history, train_loader.dataset.target_size
+    )
     print("Saved model to", path)
 
 
