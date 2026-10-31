@@ -32,9 +32,10 @@ def parse_args():
             "segmentation on the HipMRI 2D slices.\n"
             "\n"
             "The model is trained on the training split and checked against the\n"
-            "validation split after every epoch. After the final epoch it is\n"
-            "evaluated once on the test split, and its weights are saved to\n"
-            "<checkpoint-dir>/<model-name>.pt."
+            "validation split after every epoch. Whenever validation prostate\n"
+            "Dice improves, the weights are saved to <checkpoint-dir>/<model-name>.pt.\n"
+            "After the final epoch, that best model is evaluated once on the\n"
+            "test split."
         ),
         epilog=(
             "examples:\n"
@@ -271,7 +272,11 @@ def save_history(history, output_dir, model_name):
 
 
 def save_model(model, checkpoint_dir, args, history, target_size):
-    """Save the weights with the settings needed to rebuild the model, as in the notebooks."""
+    """Save the weights with the settings needed to rebuild the model, as in the notebooks.
+
+    Called whenever validation Dice improves, so epoch, val_prostate_dice and history
+    describe the epoch being saved.
+    """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     path = checkpoint_dir / f"{args.model_name}.pt"
     payload = dict(
@@ -349,8 +354,9 @@ def run(args):
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
 
-    # Training and validation
+    # Training and validation, keeping the checkpoint with the best validation prostate Dice.
     history = []
+    best_dice, best_epoch, model_path = -1.0, None, None
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.perf_counter()
         train_loss, train_dice = train_one_epoch(model, train_loader, optimizer, criterion, device)
@@ -362,12 +368,19 @@ def run(args):
             val_loss=val_loss, val_prostate_dice=val_dice,
             seconds=seconds,
         ))
+        improved = val_dice > best_dice
+        if improved:
+            best_dice, best_epoch = val_dice, epoch
+            model_path = save_model(
+                model, args.checkpoint_dir, args, history, train_loader.dataset.target_size
+            )
         elapsed = time.perf_counter() - training_start
         print(
             f"Epoch {epoch}/{args.epochs} | "
             f"train loss {train_loss:.4f} dice {train_dice:.4f} | "
             f"val loss {val_loss:.4f} dice {val_dice:.4f} | "
-            f"{seconds:.1f}s | elapsed {elapsed / 60:.1f} min",
+            f"{seconds:.1f}s | elapsed {elapsed / 60:.1f} min | "
+            f"best val {best_dice:.4f}" + (" (saved)" if improved else ""),
             flush=True,
         )
 
@@ -376,21 +389,29 @@ def run(args):
     print_profile("Training profile", profile)
     print("Saved history to", save_history(history, args.output_dir, args.model_name))
 
+    if model_path is None:
+        sys.exit("Validation prostate Dice was never a number, so no model was saved.")
+    print(f"Saved best model (epoch {best_epoch}, val prostate Dice {best_dice:.4f}) to {model_path}")
+
+    # Test the best checkpoint rather than the final epoch's weights.
+    best = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(best["model_state_dict"])
+    del best
+
     # Testing
     test_loss, test_dice = evaluate(model, test_loader, criterion, device)
-    print(f"Test loss {test_loss:.4f} dice {test_dice:.4f}")
+    print(f"Test loss {test_loss:.4f} dice {test_dice:.4f} (best epoch {best_epoch})")
 
     settings = run_settings(args, model)
     print_profile("Run settings", settings)
-    results = {"Test loss": test_loss, "Test prostate Dice": test_dice}
+    results = {
+        "Best epoch": best_epoch,
+        "Best val prostate Dice": best_dice,
+        "Test loss": test_loss,
+        "Test prostate Dice": test_dice,
+    }
     path = save_profile({**settings, **profile, **results}, args.output_dir, args.model_name)
     print("Saved summary to", path)
-
-    # Saving
-    path = save_model(
-        model, args.checkpoint_dir, args, history, train_loader.dataset.target_size
-    )
-    print("Saved model to", path)
 
 
 if __name__ == "__main__":
