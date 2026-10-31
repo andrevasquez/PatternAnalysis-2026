@@ -11,6 +11,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from tqdm.auto import tqdm
+
 from dataset import get_dataloaders
 from modules import get_model
 
@@ -147,17 +149,45 @@ def build_model(model_type, device):
     return get_model(model_type).to(device)
 
 
-def train_one_epoch(model, loader, optimizer, criterion, device):
+def train_one_epoch(model, loader, optimizer, criterion, device, training=True):
     """Run one training epoch and return (loss, prostate dice)."""
-    # TODO
-    raise NotImplementedError
+    model.train(training)
+    loss_sum, pixel_count = 0.0, 0
+    intersection, predicted_count, target_count = 0, 0, 0
+    
+    # Iterate through the dataset in batches, showing a progress bar.
+    for images, masks in tqdm(loader, leave=False, mininterval=5):
+        images = images.to(device, non_blocking=True)
+        masks = masks.to(device, non_blocking=True)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.set_grad_enabled(training):
+            logits = model(images)
+            loss = criterion(logits, masks)
+            if not torch.isfinite(loss).item():
+                raise RuntimeError("Non-finite loss encountered")
+            if training:
+                loss.backward()
+                optimizer.step()
+        valid = masks != -100 # Remove padded pixels
+        pixels = valid.sum().item() # Get batches total loss by multiplying average loss with pixels. Convert from tensor to number.
+        loss_sum += loss.item() * pixels
+        pixel_count += pixels
+        prediction = logits.detach().argmax(dim=1)
+        pred_prostate = (prediction == PROSTATE_LABEL) & valid # Criterion for predicted prostate label.
+        true_prostate = (masks == PROSTATE_LABEL) & valid # Criterion for true prostate label
+        intersection += (pred_prostate & true_prostate).sum().item() # Prediction and truth both positive
+        predicted_count += pred_prostate.sum().item()
+        target_count += true_prostate.sum().item()
+    denominator = predicted_count + target_count
+    dice = 2 * intersection / denominator if denominator else float("nan")
+    return loss_sum / pixel_count, dice
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
     """Evaluate on a validation or test loader and return (loss, prostate dice)."""
-    # TODO
-    raise NotImplementedError
+    return train_one_epoch(model, loader, None, criterion, device, training=False)
 
 
 def save_model(model, checkpoint_dir, model_name):

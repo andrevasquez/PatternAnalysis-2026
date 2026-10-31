@@ -1,24 +1,137 @@
+import torch
 import torch.nn as nn
+
 NUM_CLASSES = 6
+BASE = 16
+
+def conv_block(in_channels, out_channels, dropout=0):
+    """Two consecutive 3x3 convolutions, followed by ReLU."""
+    layers = [
+        nn.Conv2d(in_channels, out_channels, 3, padding=1),
+        nn.ReLU(),
+        nn.Conv2d(out_channels, out_channels, 3, padding=1),
+        nn.ReLU(),
+    ]
+
+    # Apply dropout only where requested by the architecture.
+    if dropout:
+        layers.append(nn.Dropout(dropout))
+
+    return nn.Sequential(*layers)
 
 class UNet(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES):
+    # Architecture adapted from GeeksforGeeks:
+    # https://www.geeksforgeeks.org/deep-learning/image-segmentation-using-u-net/
+    # Adaptations: PyTorch, single-channel MRI input, 16 starting filters, and raw output logits for CrossEntropyLoss.
+
+    def __init__(self, num_classes=NUM_CLASSES, base=BASE):
         super().__init__()
 
+        # Feature channels at each depth: [16, 32, 64, 128, 256].
+        widths = [base * 2**i for i in range(5)]
+
+        # ModuleList registers the blocks so PyTorch can train their weights.
+        self.encoders = nn.ModuleList()
+        in_channels = 1  # Grayscale MRI has one intensity channel.
+
+        for i, width in enumerate(widths):
+            self.encoders.append(
+                conv_block(
+                    in_channels,
+                    width,
+                    # Apply dropout in the two deepest blocks.
+                    dropout=0.3 if i >= 3 else 0,
+                )
+            )
+
+            # The next block receives this block's output channels.
+            in_channels = width
+
+        # Halve height and width by taking the maximum in each 2×2 region.
+        self.pool = nn.MaxPool2d(2)
+
+        self.upsamples = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+
+        # Build the decoder from deepest to shallowest level.
+        # i takes the values 4, 3, 2, 1.
+        for i in range(4, 0, -1):
+            self.upsamples.append(
+                nn.ConvTranspose2d(
+                    widths[i],
+                    widths[i - 1],
+                    kernel_size=3,
+                    # Double height and width.
+                    stride=2,         
+                    padding=1,
+                    # Resolve output size to exactly double.
+                    output_padding=1,
+                )
+            )
+
+            # Upsampled features and matching encoder features are joined.
+            # Each has widths[i - 1] channels, giving twice that many inputs.
+            self.decoders.append(
+                conv_block(2 * widths[i - 1], widths[i - 1])
+            )
+
+        # Convert the final 16 features into six class scores per pixel.
+        # A 1×1 convolution combines channels without changing image size.
+        self.output = nn.Conv2d(base, num_classes, kernel_size=1)
+
+        # Initialise feature-extraction Conv2d weights for ReLU activations.
+        # These are starting weights, not pretrained weights.
+        for layer in self.modules():
+            if isinstance(layer, nn.Conv2d) and layer is not self.output:
+                nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+                nn.init.zeros_(layer.bias)
+
+    def forward(self, x):
+        # Four halvings require dimensions divisible by 16
+        # so the encoder and decoder feature maps match.
+        if x.shape[-2] % 16 or x.shape[-1] % 16:
+            raise ValueError("Input height and width must be divisible by 16")
+
+        skips = []
+
+        # Process the first four encoder blocks.
+        # Save their outputs before pooling, preserving finer spatial detail.
+        for encoder in self.encoders[:-1]:
+            x = encoder(x)
+            skips.append(x)
+            x = self.pool(x)
+
+        # Process the deepest block without further downsampling.
+        x = self.encoders[-1](x)
+
+        # Match each decoder stage with the corresponding encoder output,
+        # starting with the deepest saved features.
+        for upsample, decoder, skip in zip(
+            self.upsamples, self.decoders, reversed(skips)
+        ):
+            x = upsample(x)
+
+            # Join feature maps along dimension 1: the channel dimension.
+            # This concatenates features; it does not add their values.
+            x = decoder(torch.cat([x, skip], dim=1))
+
+        # Returns raw scores (logits)
+        return self.output(x)
+
 class ResidualUNet(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES):
+    def __init__(self, num_classes=NUM_CLASSES, base=BASE):
         super().__init__()
 
 class IsenseeUNet(nn.Module):
-    def __init__(self, num_classes=NUM_CLASSES):
+    def __init__(self, num_classes=NUM_CLASSES, base=BASE):
         super().__init__()
 
 def get_model(model_name):
     if model_name == "baseline":
-        return UNet(num_classes=NUM_CLASSES)
+        return UNet(num_classes=NUM_CLASSES, base=BASE)
     elif model_name == "residual":
-        return ResidualUNet(num_classes=NUM_CLASSES)
+        return ResidualUNet(num_classes=NUM_CLASSES, base=BASE)
     elif model_name == "improved":
-        return IsenseeUNet(num_classes=NUM_CLASSES)
+        return IsenseeUNet(num_classes=NUM_CLASSES, base=BASE)
     else:
         raise ValueError(f"Unknown model name: {model_name}")
