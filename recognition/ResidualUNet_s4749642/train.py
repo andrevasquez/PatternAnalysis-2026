@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from dataset import get_dataloaders
+from modules import get_model
 
 # Setup constants
 NUM_CLASSES = 6
@@ -143,8 +144,7 @@ def build_loaders(data_dir, batch_size, device):
 
 def build_model(model_type, device):
     """Create the model to train: "baseline", "residual" or "improved"."""
-    # TODO: instantiate the model for model_type (see modules.ipynb)
-    raise NotImplementedError
+    return get_model(model_type).to(device)
 
 
 def train_one_epoch(model, loader, optimizer, criterion, device):
