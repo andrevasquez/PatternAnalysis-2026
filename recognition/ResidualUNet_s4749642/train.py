@@ -7,7 +7,9 @@ Example:
 import argparse
 import csv
 import random
+import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -96,8 +98,9 @@ def parse_args():
         default=Path("outputs"),
         help=(
             "Directory for run outputs: <model-name>_summary.csv\n"
-            "(settings, training profile and test results) and\n"
-            "<model-name>_history.csv (per-epoch loss and Dice).\n"
+            "(settings, training profile and test results),\n"
+            "<model-name>_history.csv (per-epoch loss and Dice) and\n"
+            "<model-name>_output.txt (copy of the command-line output).\n"
             "Created if it does not exist.\n"
             "(default: %(default)s)"
         ),
@@ -289,8 +292,44 @@ def save_model(model, checkpoint_dir, args, history, target_size):
     return path
 
 
+class Tee:
+    """Write to several streams at once, e.g. the terminal and a log file."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for stream in self.streams:
+            stream.write(text)
+
+    def flush(self):
+        for stream in self.streams:
+            stream.flush()
+
+
 def main():
     args = parse_args()
+
+    # Copy everything printed to <output-dir>/<model-name>_output.txt.
+    # tqdm progress bars go to stderr, so they stay out of the file.
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    log_path = args.output_dir / f"{args.model_name}_output.txt"
+    terminal = sys.stdout
+    with open(log_path, "w") as log:
+        sys.stdout = Tee(terminal, log)
+        try:
+            print("Command:", " ".join(sys.argv))
+            run(args)
+            print("Saved command-line output to", log_path)
+        except BaseException:
+            # Keep the error in the log as well as showing it in the terminal.
+            traceback.print_exc(file=log)
+            raise
+        finally:
+            sys.stdout = terminal
+
+
+def run(args):
     set_seed(args.seed)
 
     # Normal device setup
